@@ -19,6 +19,8 @@ import os
 import re
 import shutil
 import struct
+import subprocess
+import tempfile
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -179,7 +181,7 @@ def _read_big_header(stream) -> BigFileInfo:
     if magic not in (b"BIG\0", b"BUG\0"):
         raise ValueError(f"Header BIG non riconosciuto: {magic!r}")
     if not 1 <= num_fat <= 64 or size_fat <= 0:
-        raise ValueError("Header .bf non plausibile (size FAT / numero FAT).")
+        raise ValueError("Invalid .bf header (FAT size / FAT count).")
 
     entries: list[BigFileEntry] = []
     descriptor_pos = 44
@@ -187,15 +189,15 @@ def _read_big_header(stream) -> BigFileInfo:
         stream.seek(descriptor_pos)
         raw = stream.read(24)
         if len(raw) != 24:
-            raise ValueError(f"Descriptor FAT #{fat_index} troncato.")
+            raise ValueError(f"FAT descriptor #{fat_index} is truncated.")
         fat_max_file, _fat_max_dir, pos_fat, next_pos_fat, first_index, _last_index = struct.unpack("<6I", raw)
         if fat_max_file > size_fat:
-            raise ValueError(f"FAT #{fat_index} non plausibile.")
+            raise ValueError(f"FAT #{fat_index} is invalid.")
 
         stream.seek(pos_fat)
         file_table = stream.read(fat_max_file * 8)
         if len(file_table) != fat_max_file * 8:
-            raise ValueError(f"Tabella file FAT #{fat_index} troncata.")
+            raise ValueError(f"FAT #{fat_index} file table is truncated.")
 
         # BIG_tdst_FileExt::st_ToSave is 88 bytes in the supplied Jade source:
         # 4 length + 3*4 links + 4-byte L_time_t + 64-byte name + 4 P4 revision.
@@ -205,7 +207,7 @@ def _read_big_header(stream) -> BigFileInfo:
         stream.seek(ext_base)
         ext_table = stream.read(fat_max_file * 88)
         if len(ext_table) != fat_max_file * 88:
-            raise ValueError(f"Tabella nomi FAT #{fat_index} troncata.")
+            raise ValueError(f"FAT #{fat_index} name table is truncated.")
 
         for i in range(fat_max_file):
             position, key = struct.unpack_from("<2I", file_table, i * 8)
@@ -319,6 +321,109 @@ def decompress_pop_lzo(data: bytes) -> bytes:
         if dec_size < LZO_BLOCK_SIZE:
             break
     return bytes(output)
+
+
+def compress_pop_lzo(data: bytes) -> bytes:
+    """Recreate PopTools' v37/v38 block-LZO wrapper.
+
+    PopTools uses the 32-bit LZO 1.08 DLL and compresses 131072-byte blocks.
+    The DLL shipped with this editor is intentionally x64 for decompression,
+    so compression is delegated to the bundled 32-bit Windows PowerShell
+    host, which can load the original PopTools lzo.dll without changing it.
+    """
+    if len(data) < 8 or data[4:8] != b"\x99\xC0\xFF\xEE":
+        raise ValueError("Il BIN non contiene il magic POP 0x99C0FFEE a offset 4.")
+    repacker = Path(__file__).with_name("pop_lzo_repack.ps1")
+    if not repacker.is_file():
+        raise RuntimeError("Manca pop_lzo_repack.ps1 accanto a ova_variable_editor.py.")
+    temp_dir = Path(tempfile.mkdtemp(prefix="ova_lzo_"))
+    source = temp_dir / "input.dec"
+    target = temp_dir / "output.enc"
+    try:
+        source.write_bytes(data)
+        powershell = Path(r"C:\Windows\SysWOW64\WindowsPowerShell\v1.0\powershell.exe")
+        if not powershell.is_file():
+            raise RuntimeError("Windows PowerShell 32-bit non disponibile: impossibile usare il lzo.dll originale dei PopTools.")
+        command = [
+            str(powershell), "-NoProfile", "-ExecutionPolicy", "Bypass",
+            "-File", str(repacker), "-InputFile", str(source),
+            "-OutputFile", str(target), "-Mode", "compress",
+        ]
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        if completed.returncode != 0:
+            details = (completed.stderr or completed.stdout).strip()
+            raise RuntimeError(f"Compressione LZO POP fallita: {details or 'errore sconosciuto'}")
+        if not target.is_file():
+            raise RuntimeError("Il repacker LZO non ha prodotto l'output.")
+        return target.read_bytes()
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def _repack_legacy_bigfile(path: Path, selected: BigFileEntry, decoded_data: bytes, output: Path) -> None:
+    """Rebuild a v37/v38 BF while preserving its legacy header/tables.
+
+    The original PopTools BuildBF writes the header and all tables unchanged,
+    then writes each entry as ``uint32 size + payload``.  This implementation
+    follows that layout but recalculates every subsequent file position, so a
+    recompressed entry may grow or shrink without corrupting the following
+    entries.  The source BF is never opened for writing.
+    """
+    original = path.read_bytes()
+    info = read_bigfile(path)
+    if info.version not in (37, 38):
+        raise ValueError("La ricompressione BF automatica è implementata per i layout POP v37/v38.")
+    if selected.index < 0 or selected.index >= len(info.entries):
+        raise ValueError("Indice entry BF non valido.")
+
+    payloads: list[bytes] = []
+    for entry in info.entries:
+        if entry.index == selected.index:
+            payload = decoded_data
+        else:
+            start = entry.position + entry.data_header_size
+            length = entry.size & 0x7FFFFFFF
+            payload = original[start:start + length]
+            if len(payload) != length:
+                raise ValueError(f"Entry #{entry.index} {entry.name} troncata nel BF originale.")
+        payloads.append(payload)
+
+    # Keep the exact legacy table area. Only FileIdOffset.filePos and
+    # FileEntry.size are changed; names, links, folders, and unknown bytes are
+    # copied verbatim from the source file.
+    header_size = LEGACY_BF_HEADER_SIZE
+    capacity = info.max_file
+    fcount = len(info.entries)
+    file_id_base = header_size
+    file_entry_base = file_id_base + capacity * LEGACY_BF_FILE_TABLE_ENTRY_SIZE
+    folder_entry_base = file_entry_base + capacity * LEGACY_BF_FILE_ENTRY_SIZE
+    # Folder table length is not needed: derive the beginning of the data area
+    # from the first original payload position, which is the stable header
+    # boundary used by the PopTools writer.
+    data_header_pos = min(entry.position for entry in info.entries)
+    prefix_end = data_header_pos
+    prefix = bytearray(original[:prefix_end])
+
+    new_positions: list[int] = []
+    new_sizes: list[int] = []
+    cursor = prefix_end
+    for payload in payloads:
+        new_positions.append(cursor)
+        new_sizes.append(len(payload))
+        cursor += 4 + len(payload)
+
+    for i, (position, size) in enumerate(zip(new_positions, new_sizes)):
+        struct.pack_into("<I", prefix, file_id_base + i * 8, position)
+        struct.pack_into("<I", prefix, file_entry_base + i * LEGACY_BF_FILE_ENTRY_SIZE, size)
+
+    with output.open("wb") as stream:
+        stream.write(prefix)
+        for payload in payloads:
+            stream.write(struct.pack("<I", len(payload)))
+            stream.write(payload)
+
+    # The original legacy writer does not append a synthetic global padding
+    # area; preserve the resulting exact concatenated layout.
 
 
 def _read_legacy_bigfile(path: Path) -> BigFileInfo:
@@ -593,7 +698,7 @@ def ova_diagnostic_report(data: bytes, label: str = "buffer") -> list[str]:
     if not structures:
         fallback = find_ascii_fallback(data)
         lines.append(
-            f"  NESSUN descrittore strutturale: fallback ASCII produrrebbe {len(fallback)} stringhe (non OVA affidabili)."
+            f"  NO STRUCTURAL DESCRIPTOR: ASCII fallback would produce {len(fallback)} strings (not reliable OVA data)."
         )
         return lines
     for structure in sorted(structures, key=lambda s: (s.base, s.source_format)):
@@ -1008,25 +1113,25 @@ class App(tk.Tk):
 
         top = ttk.Frame(root)
         top.pack(fill="x", pady=(0, 8))
-        ttk.Button(top, text="Importa .BF / .BIN", command=self.open_file).pack(side="left")
-        ttk.Button(top, text="Confronta con BIN…", command=self.compare_file).pack(side="left", padx=6)
-        ttk.Button(top, text="Salva con nome…", command=self.save_as).pack(side="left", padx=6)
-        ttk.Button(top, text="Ripristina", command=self.reset).pack(side="left")
+        ttk.Button(top, text="Import .BF / .BIN", command=self.open_file).pack(side="left")
+        ttk.Button(top, text="Compare with BIN…", command=self.compare_file).pack(side="left", padx=6)
+        ttk.Button(top, text="Save as…", command=self.save_as).pack(side="left", padx=6)
+        ttk.Button(top, text="Reset", command=self.reset).pack(side="left")
         self.variable_mode_btn = ttk.Button(top, text="OVA: Jade reale", command=self.toggle_variable_mode)
         self.variable_mode_btn.pack(side="left", padx=6)
-        self.theme_btn = ttk.Button(top, text="🌙 Modalità scura", command=self.toggle_theme)
+        self.theme_btn = ttk.Button(top, text="🌙 Dark mode", command=self.toggle_theme)
         self.theme_btn.pack(side="right")
-        self.file_label = ttk.Label(top, text="Nessun file caricato")
+        self.file_label = ttk.Label(top, text="No file loaded")
         self.file_label.pack(side="left", padx=12)
 
         info = ttk.LabelFrame(root, text="File")
         info.pack(fill="x", pady=(0, 8))
-        self.info_label = ttk.Label(info, text="Importa un file BIN per iniziare.")
+        self.info_label = ttk.Label(info, text="Import a BIN file to begin.")
         self.info_label.pack(anchor="w", padx=8, pady=6)
 
         bf_select = ttk.Frame(info)
         bf_select.pack(fill="x", padx=8, pady=(0, 6))
-        ttk.Label(bf_select, text="Entry OVA/BIN/GAO/WOW nel .BF:").pack(side="left")
+        ttk.Label(bf_select, text="OVA/BIN/GAO/WOW entry in .BF:").pack(side="left")
         self.big_entry_combo = ttk.Combobox(bf_select, state="disabled", width=90)
         self.big_entry_combo.pack(side="left", fill="x", expand=True, padx=8)
         self.big_entry_combo.bind("<<ComboboxSelected>>", self.on_big_entry_selected)
@@ -1046,19 +1151,19 @@ class App(tk.Tk):
         big_tab = ttk.Frame(self.left_tabs, padding=(0, 5, 5, 0))
         self.left_tabs.add(vars_tab, text="Variabili OVA")
         self.left_tabs.add(refs_tab, text="Resource Browser")
-        self.left_tabs.add(big_tab, text="Entry nel .BF")
+        self.left_tabs.add(big_tab, text=".BF entries")
 
-        ttk.Label(vars_tab, text="Variabili OVA rilevate").pack(anchor="w")
-        ttk.Label(vars_tab, text="Jade OVA = decodifica strutturale; ASCII = fallback esplorativo").pack(anchor="w")
+        ttk.Label(vars_tab, text="Detected OVA variables").pack(anchor="w")
+        ttk.Label(vars_tab, text="Jade OVA = structural decoding; ASCII = exploratory fallback").pack(anchor="w")
         cols = ("index", "name", "offset", "type", "source")
         tree_frame = ttk.Frame(vars_tab)
         tree_frame.pack(fill="both", expand=True, pady=(5, 0))
         self.tree = ttk.Treeview(tree_frame, columns=cols, show="headings", selectmode="browse")
         self.tree.heading("index", text="#")
-        self.tree.heading("name", text="Variabile")
+        self.tree.heading("name", text="Variable")
         self.tree.heading("offset", text="Offset")
-        self.tree.heading("type", text="Tipo")
-        self.tree.heading("source", text="Origine")
+        self.tree.heading("type", text="Type")
+        self.tree.heading("source", text="Source")
         self.tree.column("index", width=45, anchor="center")
         self.tree.column("name", width=190, anchor="w")
         self.tree.column("offset", width=100, anchor="center")
@@ -1071,11 +1176,11 @@ class App(tk.Tk):
         self.tree.bind("<<TreeviewSelect>>", self.on_select)
 
         ref_cols = ("index", "extension", "name", "offset", "key", "source")
-        ttk.Label(refs_tab, text="Legenda: OVA grigio  •  OFC azzurro  •  TTT arancione").pack(anchor="w")
+        ttk.Label(refs_tab, text="Legend: OVA gray  •  OFC blue  •  TTT orange").pack(anchor="w")
         ref_frame = ttk.Frame(refs_tab)
         ref_frame.pack(fill="both", expand=True)
         self.artifact_tree = ttk.Treeview(ref_frame, columns=ref_cols, show="headings", selectmode="browse")
-        for col, title in (("index", "#"), ("extension", "Tipo"), ("name", "Risorsa / nodo"), ("offset", "Offset"), ("key", "BIG_KEY"), ("source", "Origine")):
+        for col, title in (("index", "#"), ("extension", "Type"), ("name", "Resource / node"), ("offset", "Offset"), ("key", "BIG_KEY"), ("source", "Source")):
             self.artifact_tree.heading(col, text=title)
         self.artifact_tree.column("index", width=40, anchor="center")
         self.artifact_tree.column("extension", width=70, anchor="center")
@@ -1092,10 +1197,10 @@ class App(tk.Tk):
         self.artifact_tree.tag_configure("OFC", foreground="#38a9e8")
         self.artifact_tree.tag_configure("TTT", foreground="#f39c12")
 
-        ttk.Label(big_tab, text="File .ova / .bin / .gao indicizzati nel Big File").pack(anchor="w")
+        ttk.Label(big_tab, text="Indexed .ova / .bin / .gao files in Big File").pack(anchor="w")
         big_search = ttk.Frame(big_tab)
         big_search.pack(fill="x", pady=(5, 5))
-        ttk.Label(big_search, text="Filtro:").pack(side="left")
+        ttk.Label(big_search, text="Filter:").pack(side="left")
         self.big_filter_var = tk.StringVar()
         ttk.Entry(big_search, textvariable=self.big_filter_var).pack(side="left", fill="x", expand=True, padx=6)
         self.big_filter_var.trace_add("write", lambda *_: self.refresh_big_tree())
@@ -1103,7 +1208,7 @@ class App(tk.Tk):
         big_tree_frame = ttk.Frame(big_tab)
         big_tree_frame.pack(fill="both", expand=True)
         self.big_tree = ttk.Treeview(big_tree_frame, columns=big_cols, show="headings", selectmode="browse")
-        for col, title in (("index", "#"), ("name", "Entry"), ("size", "Bytes"), ("position", "Posizione"), ("key", "BIG_KEY"), ("fat", "FAT")):
+        for col, title in (("index", "#"), ("name", "Entry"), ("size", "Bytes"), ("position", "Position"), ("key", "BIG_KEY"), ("fat", "FAT")):
             self.big_tree.heading(col, text=title)
         self.big_tree.column("index", width=70, anchor="center")
         self.big_tree.column("name", width=300, anchor="w")
@@ -1117,17 +1222,17 @@ class App(tk.Tk):
         self.big_tree.configure(yscrollcommand=big_scroll.set)
         self.big_tree.bind("<<TreeviewSelect>>", self.on_big_tree_selected)
 
-        ttk.Label(right, text="Dettaglio e modifica").pack(anchor="w")
+        ttk.Label(right, text="Details and editing").pack(anchor="w")
         detail = ttk.Frame(right)
         detail.pack(fill="x", pady=6)
-        self.hit_label = ttk.Label(detail, text="Seleziona un marker.")
+        self.hit_label = ttk.Label(detail, text="Select a marker.")
         self.hit_label.grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 8))
 
-        ttk.Label(detail, text="Offset booleano relativo al valore OVA:").grid(row=1, column=0, sticky="w")
+        ttk.Label(detail, text="Boolean offset relative to OVA value:").grid(row=1, column=0, sticky="w")
         self.offset_var = tk.StringVar(value="")
         ttk.Entry(detail, textvariable=self.offset_var, width=10).grid(row=1, column=1, sticky="w", padx=6)
         ttk.Label(detail, text="(es. -1, +4, +16)").grid(row=1, column=2, sticky="w")
-        ttk.Button(detail, text="Cerca candidati 00/01", command=self.find_candidates).grid(row=1, column=3, padx=8)
+        ttk.Button(detail, text="Find 00/01 candidates", command=self.find_candidates).grid(row=1, column=3, padx=8)
 
         self.candidates = ttk.Combobox(detail, state="readonly", width=46)
         self.candidates.grid(row=2, column=0, columnspan=4, sticky="we", pady=6)
@@ -1135,25 +1240,25 @@ class App(tk.Tk):
 
         actions = ttk.Frame(right)
         actions.pack(fill="x", pady=5)
-        self.true_btn = ttk.Button(actions, text="Imposta TRUE (01)", command=lambda: self.set_bool(1))
-        self.false_btn = ttk.Button(actions, text="Imposta FALSE (00)", command=lambda: self.set_bool(0))
+        self.true_btn = ttk.Button(actions, text="Set TRUE (01)", command=lambda: self.set_bool(1))
+        self.false_btn = ttk.Button(actions, text="Set FALSE (00)", command=lambda: self.set_bool(0))
         self.true_btn.pack(side="left")
         self.false_btn.pack(side="left", padx=6)
 
-        ttk.Label(right, text="Anteprima bytes (hex)").pack(anchor="w", pady=(12, 3))
+        ttk.Label(right, text="Byte preview (hex)").pack(anchor="w", pady=(12, 3))
         self.hex_text = tk.Text(right, height=8, wrap="none", font=("TkFixedFont", 10))
         self.hex_text.pack(fill="both", expand=True)
         self.hex_text.configure(state="disabled")
 
         log_bar = ttk.Frame(right)
         log_bar.pack(fill="x", pady=(10, 3))
-        ttk.Label(log_bar, text="Console diagnostica BF / OVA").pack(side="left")
-        ttk.Button(log_bar, text="Pulisci log", command=self.clear_log).pack(side="right")
+        ttk.Label(log_bar, text="BF / OVA diagnostic console").pack(side="left")
+        ttk.Button(log_bar, text="Clear log", command=self.clear_log).pack(side="right")
         self.log_text = tk.Text(right, height=10, wrap="word", font=("TkFixedFont", 9))
         self.log_text.pack(fill="both", expand=True)
         self.log_text.configure(state="disabled")
 
-        self.status = ttk.Label(root, text="Pronto", relief="sunken", anchor="w")
+        self.status = ttk.Label(root, text="Ready", relief="sunken", anchor="w")
         self.status.pack(fill="x", pady=(8, 0))
 
         self._apply_theme()
@@ -1196,13 +1301,13 @@ class App(tk.Tk):
 
     def toggle_theme(self) -> None:
         self.dark_mode = not self.dark_mode
-        self.theme_btn.configure(text="☀ Modalità chiara" if self.dark_mode else "🌙 Modalità scura")
+        self.theme_btn.configure(text="☀ Light mode" if self.dark_mode else "🌙 Dark mode")
         self._apply_theme()
 
     def open_file(self) -> None:
         name = filedialog.askopenfilename(
-            title="Importa BIN o Big File Jade",
-            filetypes=[("Jade / POP resources", "*.bf *.bin *.ova *.ofc *.gao *.wow"), ("Jade Big Files", "*.bf"), ("BIN files", "*.bin"), ("OVA/OFC/GAO/WOW", "*.ova *.ofc *.gao *.wow"), ("Tutti i file", "*.*")],
+            title="Import BIN or Jade Big File",
+            filetypes=[("Jade / POP resources", "*.bf *.bin *.ova *.ofc *.gao *.wow"), ("Jade Big Files", "*.bf"), ("BIN files", "*.bin"), ("OVA/OFC/GAO/WOW", "*.ova *.ofc *.gao *.wow"), ("All files", "*.*")],
         )
         if not name:
             return
@@ -1211,11 +1316,11 @@ class App(tk.Tk):
             self.open_bigfile(path)
             return
         self.clear_log()
-        self.log(f"[FILE] Apertura diretta: {path} ({path.stat().st_size:,} B)")
+        self.log(f"[FILE] Direct open: {path} ({path.stat().st_size:,} B)")
         try:
             data = path.read_bytes()
         except OSError as exc:
-            messagebox.showerror("Errore", f"Impossibile leggere il file:\n{exc}")
+            messagebox.showerror("Error", f"Unable to read file:\n{exc}")
             return
         # A standalone Univers_oin_*.bin from PoP37/38 uses the same block-LZO
         # wrapper as a .BF entry.  The decompressed stream starts with the
@@ -1229,11 +1334,11 @@ class App(tk.Tk):
                 data = decompress_pop_lzo(data)
             except (RuntimeError, ValueError) as exc:
                 self.log(f"[ERRORE] Decompressione POP-LZO fallita: {exc}")
-                messagebox.showerror("Errore LZO", f"Impossibile decomprimere il BIN POP:\n{exc}")
+                messagebox.showerror("LZO error", f"Unable to decompress POP BIN:\n{exc}")
                 return
             self.log(f"[LZO] Wrapper POP rilevato: {compressed_size:,} B -> {len(data):,} B decompressi")
         else:
-            self.log("[LZO] Nessun wrapper POP-LZO rilevato.")
+            self.log("[LZO] No POP-LZO wrapper detected.")
         self.path = path
         self.original = data
         self.working = bytearray(data)
@@ -1250,8 +1355,8 @@ class App(tk.Tk):
         self.ascii_variables = find_ascii_fallback(data)
         self.variables = self.jade_variables if self.variable_mode == "jade" else self.ascii_variables
         self.log_ova_analysis(data, path.name)
-        compression_text = " • POP-LZO decompresso per l'analisi" if self.direct_compressed else ""
-        self.info_label.config(text=f"{len(data):,} bytes • SHA-256 {sha256(data)[:16]}… • {len(self.variables)} variabili • {len(self.hits)} marker 'ova'{compression_text}")
+        compression_text = " • POP-LZO decompressed for analysis" if self.direct_compressed else ""
+        self.info_label.config(text=f"{len(data):,} bytes • SHA-256 {sha256(data)[:16]}… • {len(self.variables)} variables • {len(self.hits)} 'ova' markers{compression_text}")
         self.artifacts = find_ai_artifacts(data)
         self.ai_nodes = find_ai_nodes(data)
         self.resource_refs = find_resource_refs(data)
@@ -1260,17 +1365,17 @@ class App(tk.Tk):
 
     def open_bigfile(self, path: Path) -> None:
         self.clear_log()
-        self.log(f"[BF] Apertura: {path}")
+        self.log(f"[BF] Opening: {path}")
         try:
             info = read_bigfile(path)
         except (OSError, ValueError, MemoryError) as exc:
-            self.log(f"[ERRORE] Header/indice BIG non leggibile: {exc}")
-            messagebox.showerror("Errore Big File", f"Impossibile leggere il .bf:\n{exc}")
+            self.log(f"[ERROR] BIG header/index unreadable: {exc}")
+            messagebox.showerror("Big File error", f"Unable to read .bf:\n{exc}")
             return
 
         self.log(
             f"[BF] Header OK: BIG v{info.version}; FAT={info.num_fat}; file={len(info.entries):,}; "
-            f"universe key=0x{info.universe_key:08X}; FAT {'cifrata' if info.encrypted_fat else 'non cifrata'}"
+            f"universe key=0x{info.universe_key:08X}; FAT {'encrypted' if info.encrypted_fat else 'unencrypted'}"
         )
 
         self.path = path
@@ -1281,11 +1386,11 @@ class App(tk.Tk):
         self.working = bytearray()
         self.dirty = False
         self.file_label.config(text=f"{path.name}  [BIG v{info.version}]")
-        encrypted_text = "FAT cifrata" if info.encrypted_fat else "FAT non cifrata"
+        encrypted_text = "FAT encrypted" if info.encrypted_fat else "FAT unencrypted"
         self.info_label.config(
             text=(
                 f"{path.stat().st_size:,} bytes • BIG v{info.version} • {info.num_fat} FAT • "
-                f"{len(info.entries):,} file indicizzati • {len(self.big_entries)} entry candidate • {encrypted_text}"
+                f"{len(info.entries):,} indexed files • {len(self.big_entries)} candidate entries • {encrypted_text}"
             )
         )
         values = [self._big_entry_label(entry) for entry in self.big_entries]
@@ -1311,7 +1416,7 @@ class App(tk.Tk):
                 try:
                     data = read_bigfile_entry(path, entry)
                 except (OSError, ValueError) as exc:
-                    self.log(f"[SKIP] #{entry.index} {entry.name}: lettura/decompressione fallita: {exc}")
+                    self.log(f"[SKIP] #{entry.index} {entry.name}: read/decompression failed: {exc}")
                     continue
                 self.log(
                     f"[PROVA] #{entry.index} {entry.name}: {entry.size & 0x7FFFFFFF:,} B su disco -> "
@@ -1333,7 +1438,7 @@ class App(tk.Tk):
                     )
                     or (i < 128 and (variables or find_ova(data) or find_ai_artifacts(data)))
                 ):
-                    self.log(f"[SELEZIONE] #{entry.index} scelta automaticamente: {len(variables)} variabili decodificate.")
+                    self.log(f"[SELECTION] #{entry.index} selected automatically: {len(variables)} variables decoded.")
                     default_index = i
                     break
                 if i >= 128 and info.version not in (37, 38):
@@ -1343,9 +1448,9 @@ class App(tk.Tk):
             if default_index is not None:
                 self.big_entry_combo.current(default_index)
                 self.load_big_entry(self.big_entries[default_index])
-                self.status.config(text=f"Big File aperto: {len(values)} entry OVA/BIN/GAO indicizzate")
+                self.status.config(text=f"Big File opened: {len(values)} indexed OVA/BIN/GAO entries")
             else:
-                self.log("[AVVISO] Nessuna entry candidata è stata leggibile automaticamente.")
+                self.log("[WARNING] No candidate entry could be read automatically.")
                 self.big_entry_combo.current(0)
                 self.big_entry = self.big_entries[0]
                 self.variables = []
@@ -1356,9 +1461,9 @@ class App(tk.Tk):
                 self.resource_refs = []
                 self.ai_nodes = []
                 self.refresh_tree()
-                self.status.config(text=f"Big File aperto: {len(values)} entry indicizzate, nessuna entry leggibile automaticamente")
+                self.status.config(text=f"Big File opened: {len(values)} indexed entries, no readable entry found automatically")
         else:
-            self.log("[AVVISO] L'indice BIG non contiene entry .ova/.bin/.gao selezionabili.")
+            self.log("[WARNING] BIG index contains no selectable .ova/.bin/.gao entries.")
             self.variables = []
             self.jade_variables = []
             self.ascii_variables = []
@@ -1367,7 +1472,7 @@ class App(tk.Tk):
             self.resource_refs = []
             self.ai_nodes = []
             self.refresh_tree()
-            self.status.config(text="Big File aperto, ma non sono state trovate entry .ova/.bin/.gao candidate")
+            self.status.config(text="Big File opened, but no candidate .ova/.bin/.gao entries were found")
         self.refresh_big_tree()
 
     @staticmethod
@@ -1410,13 +1515,13 @@ class App(tk.Tk):
         try:
             data = read_bigfile_entry(self.big_info.path, entry)
         except (OSError, ValueError) as exc:
-            self.log(f"[ERRORE] Entry #{entry.index} {entry.name}: {exc}")
+            self.log(f"[ERROR] Entry #{entry.index} {entry.name}: {exc}")
             self.big_entry = entry
-            self.status.config(text=f"Entry non leggibile: {entry.name} — {exc}")
+            self.status.config(text=f"Entry unreadable: {entry.name} — {exc}")
             # Keep the indexed .BF list intact. A bad/compressed entry must
             # not erase the variables already displayed from the previous
             # selection.
-            messagebox.showwarning("Entry non leggibile", f"{entry.name}:\n{exc}")
+            messagebox.showwarning("Entry unreadable", f"{entry.name}:\n{exc}")
             return
 
         self.big_entry = entry
@@ -1480,15 +1585,15 @@ class App(tk.Tk):
         if self.variable_mode == "jade":
             self.variables = self.jade_variables
             self.variable_mode_btn.config(text="OVA: Jade reale")
-            self.status.config(text=f"Vista OVA Jade: {len(self.variables)} variabili strutturali")
+            self.status.config(text=f"Jade OVA view: {len(self.variables)} structural variables")
         else:
             self.variables = self.ascii_variables
             self.variable_mode_btn.config(text="OVA: ASCII fallback")
-            self.status.config(text=f"Vista ASCII: {len(self.variables)} stringhe candidate (non garantite OVA)")
+            self.status.config(text=f"ASCII view: {len(self.variables)} candidate strings (not guaranteed OVA)")
         self.refresh_tree()
 
     def clear_detail(self) -> None:
-        self.hit_label.config(text="Seleziona un marker.")
+        self.hit_label.config(text="Select a marker.")
         self.offset_var.set("")
         self.candidates["values"] = ()
         self._set_hex("")
@@ -1504,7 +1609,7 @@ class App(tk.Tk):
         if idx is None or idx >= len(self.variables):
             return
         variable = self.variables[idx]
-        details = [f"Variabile #{idx + 1} • {variable.name} @ 0x{variable.offset:08X}"]
+        details = [f"Variable #{idx + 1} • {variable.name} @ 0x{variable.offset:08X}"]
         if variable.var_offset is not None:
             details.append(f"offset variabile={variable.var_offset}")
         if variable.flags is not None:
@@ -1512,7 +1617,7 @@ class App(tk.Tk):
         if variable.value_absolute is not None:
             details.append(f"valore @ 0x{variable.value_absolute:08X}")
         else:
-            details.append("valore non presente nel BIN estratto")
+            details.append("value not present in extracted BIN")
         self.hit_label.config(text=" • ".join(details))
         self.offset_var.set("")
         self.candidates["values"] = ()
@@ -1526,18 +1631,18 @@ class App(tk.Tk):
 
     def compare_file(self) -> None:
         if not self.path:
-            messagebox.showwarning("Nessun file", "Importa prima il BIN SOT di riferimento.")
+            messagebox.showwarning("No file", "Import the reference SOT BIN first.")
             return
         name = filedialog.askopenfilename(
-            title="Confronta BIN",
-            filetypes=[("BIN files", "*.bin"), ("Tutti i file", "*.*")],
+            title="Compare BIN",
+            filetypes=[("BIN files", "*.bin"), ("All files", "*.*")],
         )
         if not name:
             return
         try:
             other = Path(name).read_bytes()
         except OSError as exc:
-            messagebox.showerror("Errore", f"Impossibile leggere il BIN di confronto:\n{exc}")
+            messagebox.showerror("Error", f"Unable to read comparison BIN:\n{exc}")
             return
         diffs = diff_bytes(self.original, other)
         self.comparison_path = Path(name)
@@ -1552,7 +1657,7 @@ class App(tk.Tk):
             after = "--" if d.after < 0 else f"{d.after:02X}"
             lines.append(f"0x{d.offset:08X}  {before} → {after}")
         self._set_hex("\n".join(lines))
-        self.status.config(text=f"Confronto completato: {len(diffs)} byte differenti")
+        self.status.config(text=f"Comparison complete: {len(diffs)} different bytes")
 
     def show_variable_context(self, idx: int) -> None:
         variable = self.variables[idx]
@@ -1577,14 +1682,14 @@ class App(tk.Tk):
     def find_candidates(self) -> None:
         idx = self.selected_index()
         if idx is None:
-            messagebox.showwarning("Selezione", "Seleziona prima una variabile OVA.")
+            messagebox.showwarning("Selection", "Select an OVA variable first.")
             return
         pos = self.variables[idx].value_absolute
         if pos is None:
             messagebox.showinfo(
-                "Valore non presente",
-                "Questa estrazione contiene la descrizione OVA e i nomi delle variabili, ma il buffer dei valori iniziali non è presente.\n\n" 
-                "Non cerco byte 00/01 vicino ai nomi perché sarebbe una modifica arbitraria del descriptor.",
+                "Value not present",
+                "This extraction contains the OVA description and variable names, but the initial-value buffer is not present.\n\n"
+                "I do not search for 00/01 bytes near the names because that would be an arbitrary descriptor modification.",
             )
             return
         values = []
@@ -1608,8 +1713,8 @@ class App(tk.Tk):
             self.use_candidate()
             self.status.config(text=f"Trovati {len(values)} candidati booleani nel contesto")
         else:
-            self.status.config(text="Nessun byte 00/01 trovato nel contesto")
-            messagebox.showinfo("Nessun candidato", "Non ho trovato byte 00/01 nel contesto del marker. Inserisci manualmente l'offset del byte booleano se il formato BIN lo prevede.")
+            self.status.config(text="No 00/01 bytes found in context")
+            messagebox.showinfo("No candidates", "No 00/01 bytes were found in the marker context. Enter the boolean byte offset manually if the BIN format provides one.")
 
     def use_candidate(self, _event=None) -> None:
         text = self.candidates.get()
@@ -1619,24 +1724,24 @@ class App(tk.Tk):
     def parse_offset(self) -> int | None:
         raw = self.offset_var.get().strip()
         if not raw:
-            messagebox.showwarning("Offset mancante", "Indica l'offset relativo al marker 'ova'.")
+            messagebox.showwarning("Missing offset", "Enter the offset relative to the 'ova' marker.")
             return None
         try:
             return int(raw, 0)
         except ValueError:
-            messagebox.showerror("Offset non valido", "Usa un numero decimale o esadecimale, ad esempio +4, -1 oppure 0x10.")
+            messagebox.showerror("Invalid offset", "Use a decimal or hexadecimal number, for example +4, -1, or 0x10.")
             return None
 
     def set_bool(self, value: int) -> None:
         idx = self.selected_index()
         if idx is None:
-            messagebox.showwarning("Selezione", "Seleziona una variabile OVA.")
+            messagebox.showwarning("Selection", "Select an OVA variable.")
             return
         variable = self.variables[idx]
         if variable.value_absolute is None:
             messagebox.showwarning(
-                "Valore non presente",
-                "Il BIN contiene la descrizione OVA ma non il buffer valori necessario per modificare questa variabile in sicurezza.",
+                "Value not present",
+                "The BIN contains the OVA description but not the value buffer required to safely modify this variable.",
             )
             return
         rel = self.parse_offset()
@@ -1644,19 +1749,19 @@ class App(tk.Tk):
             return
         absolute = variable.value_absolute + rel
         if absolute < 0 or absolute >= len(self.working):
-            messagebox.showerror("Fuori file", "L'offset calcolato è fuori dai limiti del BIN.")
+            messagebox.showerror("Out of file", "The calculated offset is outside the BIN limits.")
             return
         old = self.working[absolute]
         if old not in (0, 1):
-            ok = messagebox.askyesno("Conferma byte", f"Il byte 0x{absolute:08X} vale {old:02X}, non 00/01.\n\nSostituirlo comunque con {value:02X}?")
+            ok = messagebox.askyesno("Confirm byte", f"Byte 0x{absolute:08X} is {old:02X}, not 00/01.\n\nReplace it with {value:02X} anyway?")
             if not ok:
                 return
         self.working[absolute] = value
         self.dirty = True
         self.show_variable_context(idx)
-        self.status.config(text=f"Modificato 0x{absolute:08X}: {old:02X} → {value:02X}")
+        self.status.config(text=f"Modified 0x{absolute:08X}: {old:02X} → {value:02X}")
         if self._is_verified_sot_demo_cheat_edit():
-            self.log("[PATCH] mb_CheatsEnabled corrisponde al profilo SOT demo verificato. 'Salva con nome…' creerà il BF cheats-on completo.")
+            self.log("[PATCH] mb_CheatsEnabled matches the verified SOT demo profile. 'Save as…' will create the complete cheats-on BF.")
 
     def _is_verified_sot_demo_cheat_edit(self) -> bool:
         """Whether the buffer is exactly the known safe SOT-demo cheat edit."""
@@ -1674,40 +1779,40 @@ class App(tk.Tk):
         reference = self.big_info.path.with_name("SOT_DEMO_CHEATS_ON_xbox.bf")
         if not reference.is_file() or sha256(reference.read_bytes()) != SOT_DEMO_ON_SHA256:
             messagebox.showerror(
-                "Riferimento cheats-on mancante",
-                "Per questo profilo verificato serve SOT_DEMO_CHEATS_ON_xbox.bf accanto al BF demo originale, con l'hash noto.",
+                "Missing cheats-on reference",
+                "This verified profile requires SOT_DEMO_CHEATS_ON_xbox.bf next to the original demo BF, with the known hash.",
             )
             return True
         name = filedialog.asksaveasfilename(
-            title="Salva SOT demo con cheat abilitati",
+            title="Save SOT demo with cheats enabled",
             initialfile="SOT_DEMO_CHEATS_ON_xbox.bf",
             defaultextension=".bf",
-            filetypes=[("Jade Big Files", "*.bf"), ("Tutti i file", "*.*")],
+            filetypes=[("Jade Big Files", "*.bf"), ("All files", "*.*")],
         )
         if not name:
             return True
         target = Path(name)
         try:
             if target.resolve() == self.big_info.path.resolve() and not messagebox.askyesno(
-                "Sovrascrivere?", "Hai scelto il BF demo originale. Vuoi davvero sostituirlo con la variante cheats-on?"
+                "Overwrite?", "You selected the original demo BF. Do you really want to replace it with the cheats-on variant?"
             ):
                 return True
             shutil.copyfile(reference, target)
             self.dirty = False
-            self.log(f"[PATCH] Scritto BF SOT demo cheats-on verificato: {target}")
-            self.status.config(text=f"Salvato BF SOT demo cheats-on: {target.name}")
+            self.log(f"[PATCH] Saved verified SOT demo cheats-on BF: {target}")
+            self.status.config(text=f"Saved SOT demo cheats-on BF: {target.name}")
             messagebox.showinfo(
-                "Patch verificata salvata",
-                "Il BF contiene la stessa modifica verificata del riferimento cheats-on, incluse le tre entry collegate al flag Universe.",
+                "Verified patch saved",
+                "The BF contains the same verified modification as the cheats-on reference, including the three entries linked to the Universe flag.",
             )
         except OSError as exc:
-            messagebox.showerror("Errore di salvataggio", str(exc))
+            messagebox.showerror("Save error", str(exc))
         return True
 
     def reset(self) -> None:
         if not self.path:
             return
-        if self.dirty and not messagebox.askyesno("Ripristina", "Annullare tutte le modifiche non salvate?"):
+        if self.dirty and not messagebox.askyesno("Reset", "Discard all unsaved changes?"):
             return
         self.working = bytearray(self.original)
         self.dirty = False
@@ -1718,82 +1823,83 @@ class App(tk.Tk):
 
     def save_as(self) -> None:
         if not self.path:
-            messagebox.showwarning("Nessun file", "Importa prima un BIN.")
-            return
-
-        if self.direct_compressed:
-            messagebox.showwarning(
-                "BIN compresso",
-                "Questo BIN POP v37/v38 è stato decompresso LZO per l'analisi. "
-                "Il salvataggio richiederebbe la ricompressione del wrapper; per evitare di produrre un BIN invalido il salvataggio diretto è disabilitato.",
-            )
+            messagebox.showwarning("No file", "Import a BIN first.")
             return
 
         if self._save_verified_sot_demo_cheat():
             return
 
         if self.big_info is not None and self.big_entry is not None:
-            if self.big_entry.compressed:
-                messagebox.showwarning(
-                    "Entry compressa",
-                    "L'entry POP v37/v38 è compressa LZO. Posso leggerla e mostrarla correttamente, "
-                    "ma il salvataggio diretto nel .bf non è ancora sicuro perché richiede la ricompressione del blocco.",
-                )
-                return
             if not self.working or len(self.working) != len(self.original):
-                messagebox.showwarning("Entry non modificabile", "L'entry .BF corrente non contiene un buffer modificabile.")
+                messagebox.showwarning("Entry not editable", "The current .BF entry does not contain an editable buffer.")
                 return
             name = filedialog.asksaveasfilename(
-                title="Salva Big File modificato",
+                title="Save modified Big File",
                 initialfile=self.path.stem + "_edited.bf",
                 defaultextension=".bf",
-                filetypes=[("Jade Big Files", "*.bf"), ("Tutti i file", "*.*")],
+                filetypes=[("Jade Big Files", "*.bf"), ("All files", "*.*")],
             )
             if not name:
                 return
             target = Path(name)
             try:
-                if target.resolve() == self.path.resolve():
-                    if not messagebox.askyesno("Sovrascrivere?", "Hai scelto il .bf originale. Vuoi davvero sovrascriverlo?"):
-                        return
-                if target.resolve() != self.path.resolve():
-                    shutil.copyfile(self.path, target)
-                with target.open("r+b") as stream:
-                    stream.seek(self.big_entry.position + self.big_entry.data_header_size)
-                    stream.write(bytes(self.working))
+                if target.resolve() == self.big_info.path.resolve():
+                    messagebox.showwarning("Originale protetto", "Il file originale .bf non viene mai sovrascritto. Scegli un altro nome per creare il duplicato modificato.")
+                    return
+
+                if self.big_entry.compressed and self.big_info.version in (37, 38):
+                    encoded = compress_pop_lzo(bytes(self.working))
+                    rebuilt = target.with_suffix(target.suffix + ".tmp")
+                    _repack_legacy_bigfile(self.big_info.path, self.big_entry, encoded, rebuilt)
+                    os.replace(rebuilt, target)
+                else:
+                    shutil.copyfile(self.big_info.path, target)
+                    with target.open("r+b") as stream:
+                        stream.seek(self.big_entry.position + self.big_entry.data_header_size)
+                        stream.write(bytes(self.working))
                 self.dirty = False
                 digest = sha256(bytes(self.working))
-                self.status.config(text=f"Big File salvato: {target}")
+                self.status.config(text=f"Big File saved: {target}")
                 messagebox.showinfo(
-                    "Salvato",
-                    f"Entry aggiornata nel Big File:\n{target}\n\n"
+                    "Saved",
+                    f"Duplicato Big File creato:\n{target}\n\n"
                     f"Entry: #{self.big_entry.index} {self.big_entry.name}\n"
-                    f"Offset dati: 0x{self.big_entry.position + self.big_entry.data_header_size:08X}\n"
+                    f"Compressione: {self.big_entry.compression if self.big_entry.compressed else 'nessuna'}\n"
                     f"SHA-256 entry: {digest}",
                 )
-            except OSError as exc:
-                messagebox.showerror("Errore di salvataggio", str(exc))
+            except (OSError, RuntimeError, ValueError) as exc:
+                messagebox.showerror("Save error", str(exc))
             return
 
         name = filedialog.asksaveasfilename(
-            title="Salva BIN modificato",
+            title="Save modified BIN",
             initialfile=self.path.stem + "_edited.bin",
             defaultextension=".bin",
-            filetypes=[("BIN files", "*.bin"), ("Tutti i file", "*.*")],
+            filetypes=[("BIN files", "*.bin"), ("All files", "*.*")],
         )
         if not name:
             return
         target = Path(name)
         try:
             if target.resolve() == self.path.resolve():
-                if not messagebox.askyesno("Sovrascrivere?", "Hai scelto il file originale. Vuoi davvero sovrascriverlo?"):
-                    return
-            target.write_bytes(bytes(self.working))
+                messagebox.showwarning("Originale protetto", "Il file originale .bin non viene mai sovrascritto. Scegli un altro nome per creare il duplicato modificato.")
+                return
+            if self.direct_compressed:
+                encoded = compress_pop_lzo(bytes(self.working))
+                target.write_bytes(encoded)
+            else:
+                target.write_bytes(bytes(self.working))
             self.dirty = False
-            self.status.config(text=f"Salvato: {target}")
-            messagebox.showinfo("Salvato", f"File scritto correttamente:\n{target}\n\nSHA-256: {sha256(bytes(self.working))}")
-        except OSError as exc:
-            messagebox.showerror("Errore di salvataggio", str(exc))
+            self.status.config(text=f"Saved: {target}")
+            messagebox.showinfo(
+                "Saved",
+                f"Duplicato BIN creato:\n{target}\n\n"
+                f"Compressione: {'POP-LZO' if self.direct_compressed else 'nessuna'}\n"
+                f"SHA-256 dati decompressi: {sha256(bytes(self.working))}\n"
+                f"SHA-256 file salvato: {sha256(target.read_bytes())}",
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            messagebox.showerror("Save error", str(exc))
 
 
 if __name__ == "__main__":
